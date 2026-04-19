@@ -32,7 +32,7 @@ env_runner:
   env_meta_fn: diffusion_policy.env.robomimic.can_with_obs_env.patch_can_with_obs_env_meta
   env_meta_fn_kwargs:
     obstacle_cfg:
-      pos: [0.10, 0.29, 0.10] #y <-> 
+      pos: [10.10, 10.29, 0.10] #y <-> 
       radius: 0.02
       height: 0.46
       rgba: [0.35, 0.35, 0.35, 1.0]

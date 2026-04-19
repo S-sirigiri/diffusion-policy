@@ -26,10 +26,10 @@ from .cost_constraint_objective import CostConstraintObjective
 
 # ========== Hyperparameters (single place to edit) ==========
 # Which guidance to use: "none" | "linear_combo" | "fkc"
-GUIDANCE_MODE = "none"
+GUIDANCE_MODE = "linear_combo"
 
 # Linear combination (score + (beta_guid/2) * grad_J)
-BETA_GUID = 1.0
+BETA_GUID = 1000000.0
 
 # FKC (Feynman-Kac correctors with SMC)
 FKC_NUM_PARTICLES = 8
@@ -247,7 +247,20 @@ class Inference:
     """
 
     _COND_UNSET = object()
-    cost_constraint_objective = CostConstraintObjective()
+
+    def __init__(self):
+        super().__init__()
+        self.cost_constraint_objective = CostConstraintObjective()
+
+    def _configure_cost_constraint_objective(self):
+        action_normalizer = None
+        if hasattr(self, "normalizer") and "action" in self.normalizer.params_dict:
+            action_normalizer = self.normalizer["action"]
+        action_dim = getattr(self, "action_dim", None)
+        self.cost_constraint_objective.set_runtime_context(
+            action_normalizer=action_normalizer,
+            action_dim=action_dim,
+        )
 
     def conditional_sample(
         self,
@@ -270,6 +283,9 @@ class Inference:
         mode = guidance_mode if guidance_mode is not None else GUIDANCE_MODE
         use_linear = mode == "linear_combo"
         use_fkc = mode == "fkc"
+
+        if use_linear or use_fkc:
+            self._configure_cost_constraint_objective()
 
         if use_fkc:
             return self._conditional_sample_fkc(

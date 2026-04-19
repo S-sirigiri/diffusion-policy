@@ -1,14 +1,15 @@
 """
 Cost and constraint objective for cost-guided diffusion inference.
 
-Edit only the cost(), equality_penalty(), and inequality_penalty() methods.
-All gradients are computed automatically via autograd in J_and_grad().
+This objective is now specialized for inference-time cylinder avoidance on
+the can-with-obstacle image task. The diffusion model samples in normalized
+action space, so this module first reconstructs world-frame end-effector
+positions before applying any geometry-based penalties.
 """
 
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 
 class CostConstraintObjective:
@@ -67,111 +68,100 @@ class CostConstraintObjective:
         if target_state is not None:
             self.target_state = target_state
 
+        # Runtime context injected by the live inference policy.
+        self.action_normalizer = None
+        self.action_dim: Optional[int] = None
+
+        # Hardcoded geometry for can_with_obs_image_abs.
+        self.cylinder_center_xy = (0.15, 0.29)
+        self.cylinder_radius = 0.02
+        self.cylinder_epsilon = 0.02
+
+    def set_runtime_context(self, action_normalizer, action_dim: Optional[int]) -> None:
+        self.action_normalizer = action_normalizer
+        self.action_dim = action_dim
+
+    def _zeros(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+    def _as_like(self, values, ref: torch.Tensor) -> torch.Tensor:
+        return torch.as_tensor(values, device=ref.device, dtype=ref.dtype)
+
+    def _action_trajectory_world(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.action_normalizer is None:
+            return None
+
+        action_dim = self.action_dim if self.action_dim is not None else x.shape[-1]
+        if action_dim <= 0 or x.shape[-1] < action_dim:
+            return None
+
+        action_traj = x[..., :action_dim]
+        return self.action_normalizer.unnormalize(action_traj)
+
+    def _eef_positions_world(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        action_world = self._action_trajectory_world(x)
+        if action_world is None or action_world.shape[-1] < 3:
+            return None
+        return action_world[..., :3]
+
+    def _cylinder_avoidance_penalty(self, position: torch.Tensor) -> torch.Tensor:
+        cylinder_center_xy = self._as_like(self.cylinder_center_xy, position)
+        effective_radius = self.cylinder_radius + self.cylinder_epsilon
+
+        delta_xy = position[..., :2] - cylinder_center_xy
+        squared_distance = delta_xy.square().sum(dim=-1)
+        violation = torch.clamp(effective_radius ** 2 - squared_distance, min=0.0)
+        return violation
+
+
     # ------------- EDIT THESE THREE METHODS ONLY -------------
 
     def cost(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Example cost function.
+        Placeholder cost term.
 
-        x: (B, T, D) or (B, ..., D)
-        Returns: (B,) cost per sample.
-
-        Example here:
-        - Quadratic energy over the entire trajectory:
-          sum over all non-batch dimensions of x^2.
+        Uses world-frame end-effector smoothness over the full trajectory,
+        but is disabled by multiplying the result by zero.
         """
-        B = x.shape[0]
-        cost_val = (x ** 2).view(B, -1).sum(dim=1)
+        positions = self._eef_positions_world(x)
+        if positions is None or positions.shape[1] < 2:
+            return self._zeros(x)
+
+        deltas = positions[:, 1:, :] - positions[:, :-1, :]
+        cost_val = deltas.square().reshape(x.shape[0], -1).sum(dim=1)
         return cost_val * 0.0
 
     def equality_penalty(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Example equality-constraint penalty.
+        Placeholder equality-like term.
 
-        Returns: (B,) penalty per sample.
-
-        Example here:
-        - Terminal state x_T should be close to target_state (if provided):
-          c_eq * ||x_T - target_state||^2.
-        - If no target_state is provided, the penalty is zero.
+        Penalizes terminal velocity as a simple terminal consistency proxy,
+        but is disabled by multiplying the result by zero.
         """
-        B = x.shape[0]
-        if self.target_state is None:
-            return torch.zeros(B, device=x.device, dtype=x.dtype)
+        positions = self._eef_positions_world(x)
+        if positions is None or positions.shape[1] < 2:
+            return self._zeros(x)
 
-        # Ensure target_state is broadcastable to (B, D_flat)
-        if self.target_state.dim() == 1:
-            target = self.target_state.unsqueeze(0)  # (1, D)
-        else:
-            target = self.target_state
-
-        # Assume last time step is the terminal state: x[:, -1, :]
-        x_T = x[:, -1, ...]  # (B, D or ...)
-        diff = x_T.view(B, -1) - target.view(1, -1)
-        eq_pen = self.c_eq * (diff ** 2).sum(dim=1)
+        terminal_step = positions[:, -1, :] - positions[:, -2, :]
+        eq_pen = self.c_eq * terminal_step.square().sum(dim=1)
         return eq_pen * 0.0
 
     def inequality_penalty(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Example inequality-constraint penalty.
+        Trajectory-wide cylinder avoidance penalty in world coordinates.
 
-        Returns: (B,) penalty per sample.
-
-        Example here:
-        - Enforce that the second coordinate of the terminal state
-          (e.g. a "height" or y-position) is >= 0:
-          c_ineq * softplus(-y_T)^2   (smooth hinge).
-        - If feature dimension < 2, penalty is zero.
+        The cylinder is treated as infinitely tall, so only the xy-plane is
+        constrained. All sampled action steps contribute to the penalty.
         """
-        """B = x.shape[0]
-        if x.size(-1) < 2:
-            return torch.zeros(B, device=x.device, dtype=x.dtype)
+        positions = self._eef_positions_world(x)
+        if positions is None:
+            return self._zeros(x)
 
-        # Terminal state
-        x_T = x[:, -1, ...]      # (B, D)
-        y_T = x_T[..., 1]        # (B,)
-
-        # Positive part of violation: y_T < 0  ->  softplus(-y_T)
-        v = F.softplus(self.softplus_beta * (-y_T)) / self.softplus_beta
-        ineq_pen = self.c_ineq * (v ** 2)
+        violation = self._cylinder_avoidance_penalty(positions)
+        ineq_pen = self.c_ineq * violation.reshape(x.shape[0], -1).sum(dim=1)
         return ineq_pen
-        
-        B = x.shape[0]
-        if x.size(-1) < 2:
-            return torch.zeros(B, device=x.device, dtype=x.dtype)
 
-        # If x is already normalized and you want the normalized threshold:
-        y_threshold_norm = (384.0 / 512.0) * 2.0 - 1.0
-
-        # Use all time steps
-        y = x[..., 1]  # shape (B, T, ...)
-
-        # Penalize when y < threshold
-        v = F.softplus(self.softplus_beta * (y - y_threshold_norm)) / self.softplus_beta
-
-        # Aggregate over all non-batch dimensions
-        ineq_pen = self.c_ineq * (v ** 2).view(B, -1).sum(dim=1)
-        return ineq_pen * 100"""
-
-        B = x.shape[0]
-        if x.size(-1) < 2:
-            return torch.zeros(B, device=x.device, dtype=x.dtype)
-
-        # Use all time steps, not just the last one
-        x_coord = x[..., 0]  # shape (B, T, ...)
-        y_coord = x[..., 1]  # shape (B, T, ...)
-
-        # Violation is positive when y > -x
-        violation = x_coord + y_coord
-
-        # Smooth hinge
-        v = F.softplus(self.softplus_beta * violation) / self.softplus_beta
-
-        # Aggregate over all non-batch dimensions
-        ineq_pen = self.c_ineq * (v ** 2).view(B, -1).sum(dim=1)
-        return ineq_pen * 100
-
-        # ------------- Derived helpers (do NOT edit) -------------
+    # ------------- Derived helpers (do NOT edit) -------------
 
     def J(self, x: torch.Tensor) -> torch.Tensor:
         """
